@@ -1,0 +1,9 @@
+node_modules/
+target/
+.cache/
+spikes/collaboration/results.json
+dist/
+test-results/
+*.log
+.env
+.env.*

@@ -1,0 +1,16 @@
+{
+  "name": "mockpad-collaboration-spike",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node run.mjs" },
+  "dependencies": {
+    "monaco-editor": "0.57.0",
+    "yjs": "13.6.33",
+    "y-monaco": "0.1.6",
+    "y-protocols": "1.0.7"
+  },
+  "devDependencies": {
+    "vite": "8.0.3",
+    "playwright-core": "1.64.1"
+  }
+}

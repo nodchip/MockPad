@@ -1,0 +1,95 @@
+# MockPad
+
+面接官と受験者が、URLで同じ部屋に入り、コードを共同編集する模擬面接用サービス。
+通話と面接後の講評・振り返りはDiscordで行います。
+
+RustとMonaco Editorによる初版です。ログインなしで部屋を作り、参加URLを共有して利用できます。
+
+## できること
+
+- 1部屋1コードのリアルタイム共同編集
+- 言語別のシンタックスハイライト、部屋で共有する言語・タブサイズ
+- Enterの自動インデントと、スペースを使うTab入力
+- 参加者の表示名・色・カーソル・選択範囲の共有
+- 自分の編集だけを取り消すUndo／Redo（ボタン・キーボード・右クリックメニュー）
+- 接続状態の表示と、一時切断後の自動再接続
+- 面接官だけが行える部屋の終了
+
+部屋とコードはRustサーバーのメモリー上だけに保持します。
+面接官が終了するか、全員不在のまま24時間経過すると削除します。サーバー再起動時の復元はしません。
+コード実行、通話、チャット、面接履歴、フィードバック保存は含みません。
+
+## ローカルで起動
+
+Node.js 24、npm、Rustのstableツールチェーンが必要です。リポジトリ直下で実行します。
+
+```sh
+npm ci
+npm run build
+cargo run --release --locked
+```
+
+[http://127.0.0.1:3000](http://127.0.0.1:3000)を開きます。
+PowerShellでnpmの実行ポリシーに制限がある場合は、`npm`を`npm.cmd`に置き換えてください。
+
+1. 面接官が表示名を入力して部屋を作成します。
+2. 「参加URLをコピー」で取得したURLを、Discordなどで受験者に共有します。
+3. 受験者が表示名を入力して入室します。
+4. 通話しながら同じコードを編集します。
+5. 面接官の「部屋を終了」で、部屋とコードを削除できます。
+
+同じブラウザープロファイルでは、再読み込み後もCookieで面接官を識別します。
+参加URLには管理情報を含めません。別ブラウザーへの管理権限移譲はありません。
+
+## 開発
+
+ターミナルを2つ使います。
+
+```sh
+# ターミナル1: Rust API・WebSocketサーバー
+cargo run --locked
+
+# ターミナル2: フロントエンド開発サーバー
+npm run dev
+```
+
+[http://127.0.0.1:5173](http://127.0.0.1:5173)を開きます。APIとWebSocketはViteからRustへ転送します。
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `MOCKPAD_ADDR` | `127.0.0.1:3000` | Rustサーバーの待受アドレス |
+| `MOCKPAD_PUBLIC_ORIGIN` | 未設定 | 公開時のブラウザー側Origin。例: `https://mockpad.example.com` |
+
+HTTPSのリバースプロキシ配下では`MOCKPAD_PUBLIC_ORIGIN`を指定し、`/api/rooms/{id}/ws`のWebSocket転送を有効にします。
+`https://`を指定した場合は管理CookieにもSecure属性を付けます。
+初版は単一プロセス用です。GitHubリポジトリの公開と、サービスのホスティングは別の作業です。
+
+## 検証
+
+```sh
+cargo fmt --check
+cargo clippy --locked -- -D warnings
+cargo test --locked
+npm run build
+cargo build --locked
+npm run test:e2e
+```
+
+E2Eは専用サーバーを`127.0.0.1:3187`に起動し、独立した2つのブラウザー環境から実画面を操作します。
+Windowsではインストール済みのMicrosoft Edgeを使います。Linuxでは次のコマンドでChromiumを準備します。
+
+```sh
+npx playwright-core install --with-deps chromium
+```
+
+Rust側の5テストで終了権限と24時間の期限境界を確認します。
+E2Eの14項目では共同編集、Undo／Redo、設定、インデント、参加者表示、再接続、終了、再起動などを確認します。
+Windows/Edgeで検証済みです。macOS実機でのCmdキー操作と、インターネット経由の端末間通信は未検証です。
+結果とスクリーンショットは`test-results/`に出力します。GitHub Actionsでも同じ検証を実行します。
+
+## 設計資料
+
+- [要件・構成・適合確認](docs/shaping.md)
+- [画面・操作・データの流れ](docs/breadboard.md)
+- [実装順序と受け入れ条件](docs/slices.md)
+- [共同編集構成の検証結果と再実行方法](spikes/collaboration/README.md)
