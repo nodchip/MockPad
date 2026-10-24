@@ -62,6 +62,11 @@ async function landing(roomId?: string) {
     try {
       if (!roomId) {
         const response = await api('/api/rooms', { method: 'POST' });
+        if (response.status === 429) {
+          element('error').textContent = '部屋作成の上限に達しました。しばらく待ってから再度お試しください。';
+          button.disabled = false;
+          return;
+        }
         if (!response.ok) throw new Error();
         roomId = (await response.json()).id as string;
         history.pushState(null, '', `/r/${roomId}`);
@@ -206,6 +211,13 @@ class RoomEditor {
   }
 
   private send(data: Uint8Array) {
+    if (data.byteLength > 256 * 1024) {
+      // Finish the Yjs/Monaco transaction before disposing its model and observers.
+      queueMicrotask(() => {
+        if (!this.disposed) unavailable('一度に送れる編集量の上限を超えました。新しい部屋で、入力を分けてお試しください。');
+      });
+      return;
+    }
     if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(data);
   }
 
@@ -257,6 +269,10 @@ class RoomEditor {
       socket.onclose = event => {
         if (this.disposed || this.socket !== socket) return;
         if (event.code === 4000) { unavailable('部屋を終了しました。コードは削除されました。'); return; }
+        if (event.code === 4002 || event.code === 1009) {
+          unavailable('入力内容または通信量が上限を超えたため接続を終了しました。編集を続けるには新しい部屋を作成してください。');
+          return;
+        }
         this.scheduleRetry();
       };
       socket.onerror = () => socket.close();
@@ -291,8 +307,8 @@ class RoomEditor {
     const rules: string[] = [];
     const used = new Set<string>();
     for (const [id, state] of [...this.awareness.getStates()].sort((a, b) => a[0] - b[0])) {
-      if (!state.user) continue;
-      const name = String(state.user.name ?? '参加者').slice(0, 40);
+      if (!state.user || typeof state.user !== 'object') continue;
+      const name = typeof state.user.name === 'string' ? state.user.name.slice(0, 40) : '参加者';
       const preferred = palette.includes(state.user.color) ? state.user.color as string : palette[0];
       const color = used.has(preferred) ? (palette.find(c => !used.has(c)) ?? preferred) : preferred;
       used.add(color);

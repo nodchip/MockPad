@@ -34,6 +34,8 @@ Monaco 0.56以降で公開ESMパスが変更され、y-monaco 0.1.6は旧パス
 調整前の実行はimport解決で失敗した。Viteのaliasで公開パス`monaco-editor/editor`へ接続すると、7項目すべて合格した。
 本体でもこのaliasを適用する。node_modulesの直接編集は不要。
 
+Monaco 0.57.0内蔵のDOMPurify 3.4.15は、追加のVite aliasでnpmの修正版3.4.17へ接続する。本体とスパイクの両方で同じ置き換えを適用する。
+
 Yrs 0.28.0の既定クライアントID形式と、Yjs 13の形式を合わせるため、Cargo.tomlの`small-client`指定を維持する。
 
 ## 確認していないこと

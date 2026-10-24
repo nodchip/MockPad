@@ -7,15 +7,18 @@
     "dev": "vite --host 127.0.0.1",
     "check": "tsc --noEmit",
     "build": "npm run check && vite build",
-    "test:e2e": "node tests/e2e.mjs"
+    "test:e2e": "node tests/e2e.mjs",
+    "test:security": "node tests/security.mjs"
   },
   "dependencies": {
+    "dompurify": "3.4.17",
     "monaco-editor": "0.57.0",
     "yjs": "13.6.33",
     "y-monaco": "0.1.6",
     "y-protocols": "1.0.7",
     "lib0": "^0.2.114"
   },
+  "overrides": { "dompurify": "3.4.17" },
   "devDependencies": {
     "vite": "8.0.3",
     "typescript": "~5.9.3",

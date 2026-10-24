@@ -24,6 +24,8 @@ const server = await createServer({
   root, server: { host: '127.0.0.1', port: 0 },
   resolve: { alias: [{
     find: 'monaco-editor/esm/vs/editor/editor.api.js', replacement: 'monaco-editor/editor',
+  }, {
+    find: './dompurify/dompurify.js', replacement: 'dompurify',
   }] },
   plugins: [{ name: 'rust-spike-bridge', configureServer(vite) {
     vite.middlewares.use('/sync', async (req, res) => {
