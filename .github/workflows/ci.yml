@@ -17,9 +17,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
+      - run: python3 -m unittest discover -s deploy/nighthawk -p test_health.py
       - run: cargo build --locked
       - run: npm ci --no-audit --no-fund
       - run: npm run build
       - run: npx playwright-core install --with-deps chromium
       - run: npm run test:e2e
+      - run: cargo build --release --locked
       - run: npm run test:security
+      - run: npm run build && npm run test:e2e && npm run test:security
+        env:
+          MOCKPAD_BASE_PATH: /mockpad

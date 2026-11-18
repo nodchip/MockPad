@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -22,19 +22,22 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 use yrs::{
-    Doc, Map, Transact,
+    Doc, Map, ReadTxn, StateVector, Transact, Update,
     encoding::read::Cursor,
     sync::{Awareness, DefaultProtocol, Message, MessageReader, Protocol, SyncMessage},
     updates::{
-        decoder::DecoderV1,
+        decoder::{Decode, DecoderV1},
         encoder::{Encode, Encoder, EncoderV1},
     },
 };
 
+mod schema;
 mod wire;
 
 const ROOM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const UNJOINED_ROOM_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_ROOMS: usize = 32;
+const MAX_ROOMS_PER_SOURCE: usize = 8;
 const MAX_PEERS: usize = 8;
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_ROOM_UPDATE_BYTES: usize = 2 * 1024 * 1024;
@@ -48,6 +51,8 @@ type ApiResult = Result<Response, StatusCode>;
 struct App {
     rooms: Rooms,
     origin: Option<String>,
+    base_path: String,
+    trusted_proxy: Option<IpAddr>,
     admissions: Arc<Mutex<HashMap<IpAddr, Admission>>>,
     connections: Arc<Semaphore>,
 }
@@ -108,6 +113,8 @@ struct Peer {
     cancel: Arc<Notify>,
     client_id: Option<yrs::block::ClientID>,
     traffic: Rate,
+    sync_step1_seen: bool,
+    awareness_query_seen: bool,
 }
 
 impl Peer {
@@ -120,6 +127,8 @@ impl Peer {
                 cancel: Arc::default(),
                 client_id: None,
                 traffic: Rate::default(),
+                sync_step1_seen: false,
+                awareness_query_seen: false,
             },
             rx,
         )
@@ -151,6 +160,8 @@ impl Peer {
 }
 
 struct Room {
+    source: IpAddr,
+    has_joined: bool,
     host_secret: String,
     awareness: Awareness,
     peers: HashMap<Uuid, Peer>,
@@ -159,6 +170,7 @@ struct Room {
     update_bytes: usize,
     update_blocks: usize,
     traffic: Rate,
+    schema: schema::Schema,
 }
 
 impl Room {
@@ -177,7 +189,7 @@ impl Room {
         Ok(())
     }
 
-    fn new() -> Self {
+    fn new(source: IpAddr) -> Self {
         let doc = Doc::new();
         doc.get_or_insert_text("code");
         let settings = doc.get_or_insert_map("settings");
@@ -186,7 +198,18 @@ impl Room {
             settings.insert(&mut txn, "language", "plaintext");
             settings.insert(&mut txn, "tabSize", 4);
         }
+        let initial = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let schema = wire::validate(
+            &Message::Sync(SyncMessage::Update(initial)).encode_v1(),
+            &schema::Schema::default(),
+        )
+        .expect("the initial settings follow the document schema")
+        .additions;
         Self {
+            source,
+            has_joined: false,
             host_secret: Uuid::new_v4().simple().to_string(),
             awareness: Awareness::new(doc),
             peers: HashMap::new(),
@@ -195,14 +218,20 @@ impl Room {
             update_bytes: 0,
             update_blocks: 0,
             traffic: Rate::default(),
+            schema,
         }
     }
 
     fn expired(&self, now: Instant) -> bool {
+        let ttl = if self.has_joined {
+            ROOM_TTL
+        } else {
+            UNJOINED_ROOM_TTL
+        };
         self.peers.is_empty()
             && self
                 .idle_since
-                .is_some_and(|since| now.saturating_duration_since(since) >= ROOM_TTL)
+                .is_some_and(|since| now.saturating_duration_since(since) >= ttl)
     }
 
     fn broadcast(&self, data: Vec<u8>, except: Option<Uuid>) {
@@ -241,7 +270,27 @@ impl Room {
 }
 
 impl App {
+    fn client_ip(&self, remote: Remote, headers: &HeaderMap) -> Result<IpAddr, StatusCode> {
+        let peer = remote_ip(remote).to_canonical();
+        if self.trusted_proxy != Some(peer) {
+            return Ok(peer);
+        }
+        // A trusted proxy must overwrite this single-value header, never append to it.
+        let mut values = headers.get_all("x-real-ip").iter();
+        let value = values.next().ok_or(StatusCode::BAD_REQUEST)?;
+        if values.next().is_some() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .ok_or(StatusCode::BAD_REQUEST)
+    }
+
     fn admit(&self, ip: IpAddr, creating: bool) -> Result<(), StatusCode> {
+        let ip = quota_key(ip);
         let now = Instant::now();
         let window = Duration::from_secs(60);
         let mut admissions = self.admissions.lock().unwrap();
@@ -326,15 +375,33 @@ fn remote_ip(remote: Remote) -> IpAddr {
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
 
+fn quota_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => IpAddr::V4(ip),
+        IpAddr::V6(ip) => {
+            let mut prefix = ip.octets();
+            prefix[8..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(prefix))
+        }
+    }
+}
+
 async fn create_room(State(app): State<App>, remote: Remote, headers: HeaderMap) -> ApiResult {
     app.check_origin(&headers)?;
-    app.admit(remote_ip(remote), true)?;
+    let source = quota_key(app.client_ip(remote, &headers)?);
+    app.admit(source, true)?;
     let mut rooms = app.rooms.lock().unwrap();
-    if rooms.len() >= MAX_ROOMS {
+    if rooms.len() >= MAX_ROOMS
+        || rooms
+            .values()
+            .filter(|room| room.lock().unwrap().source == source)
+            .count()
+            >= MAX_ROOMS_PER_SOURCE
+    {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     let id = Uuid::new_v4().simple().to_string();
-    let room = Room::new();
+    let room = Room::new(source);
     let secure = if app
         .origin
         .as_deref()
@@ -345,8 +412,8 @@ async fn create_room(State(app): State<App>, remote: Remote, headers: HeaderMap)
         ""
     };
     let cookie = format!(
-        "mockpad_host={}; Path=/api/rooms/{id}; HttpOnly; SameSite=Strict{secure}",
-        room.host_secret
+        "mockpad_host={}; Path={}/api/rooms/{id}; HttpOnly; SameSite=Strict{secure}",
+        room.host_secret, app.base_path
     );
     rooms.insert(id.clone(), Arc::new(Mutex::new(room)));
     let mut response = (StatusCode::CREATED, Json(json!({ "id": id }))).into_response();
@@ -400,7 +467,7 @@ async fn upgrade(
     ws: WebSocketUpgrade,
 ) -> ApiResult {
     app.check_origin(&headers)?;
-    app.admit(remote_ip(remote), false)?;
+    app.admit(app.client_ip(remote, &headers)?, false)?;
     let room = app.lookup(&id)?;
     if room.lock().unwrap().peers.len() >= MAX_PEERS {
         return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -427,7 +494,7 @@ fn handle_message(room: &mut Room, peer_id: Uuid, data: &[u8]) -> Result<(), ()>
         return Err(());
     }
     room.allow_traffic(peer_id, data.len())?;
-    let cost = wire::validate(data)?;
+    let cost = wire::validate(data, &room.schema)?;
     if cost.bytes > MAX_ROOM_UPDATE_BYTES - room.update_bytes
         || cost.blocks > MAX_ROOM_BLOCKS - room.update_blocks
     {
@@ -441,6 +508,11 @@ fn handle_message(room: &mut Room, peer_id: Uuid, data: &[u8]) -> Result<(), ()>
         let message = message.map_err(|_| ())?;
         match message {
             Message::Sync(SyncMessage::SyncStep1(vector)) => {
+                let peer = room.peers.get_mut(&peer_id).ok_or(())?;
+                if peer.sync_step1_seen {
+                    return Err(());
+                }
+                peer.sync_step1_seen = true;
                 let response = DefaultProtocol
                     .handle_sync_step1(&mut room.awareness, vector)
                     .map_err(|_| ())?
@@ -450,16 +522,20 @@ fn handle_message(room: &mut Room, peer_id: Uuid, data: &[u8]) -> Result<(), ()>
                 }
             }
             Message::Sync(SyncMessage::SyncStep2(update) | SyncMessage::Update(update)) => {
-                DefaultProtocol
-                    .handle_message(
-                        &mut room.awareness,
-                        Message::Sync(SyncMessage::Update(update.clone())),
-                    )
-                    .map_err(|_| ())?;
-                room.broadcast(
-                    Message::Sync(SyncMessage::Update(update)).encode_v1(),
-                    Some(peer_id),
-                );
+                let canonical = {
+                    let update = Update::decode_v1(&update).map_err(|_| ())?;
+                    let mut txn = room.awareness.doc().transact_mut();
+                    txn.apply_update(update).map_err(|_| ())?;
+                    txn.encode_update_v1()
+                };
+                // Relay only changes actually accepted by the document. Replaying
+                // forged bytes for an already-known ID must not affect a new peer.
+                if canonical != Update::EMPTY_V1 {
+                    room.broadcast(
+                        Message::Sync(SyncMessage::Update(canonical)).encode_v1(),
+                        Some(peer_id),
+                    );
+                }
             }
             Message::Awareness(update) => {
                 // Each socket owns only its own presence, including removal on disconnect.
@@ -497,6 +573,11 @@ fn handle_message(room: &mut Room, peer_id: Uuid, data: &[u8]) -> Result<(), ()>
                 room.broadcast(Message::Awareness(update).encode_v1(), Some(peer_id));
             }
             Message::AwarenessQuery => {
+                let peer = room.peers.get_mut(&peer_id).ok_or(())?;
+                if peer.awareness_query_seen {
+                    return Err(());
+                }
+                peer.awareness_query_seen = true;
                 let update = room.awareness.update().map_err(|_| ())?;
                 if let Some(peer) = room.peers.get(&peer_id) {
                     peer.send(WsMessage::Binary(
@@ -507,6 +588,7 @@ fn handle_message(room: &mut Room, peer_id: Uuid, data: &[u8]) -> Result<(), ()>
             _ => return Err(()),
         }
     }
+    room.schema.extend(cost.additions);
     Ok(())
 }
 
@@ -533,17 +615,13 @@ async fn connect(mut socket: WebSocket, room: Arc<Mutex<Room>>, _permit: OwnedSe
                 return;
             }
             room.idle_since = None;
+            room.has_joined = true;
             room.peers.insert(id, peer);
             true
         }
     };
     if !accepted {
-        let _ = socket
-            .send(WsMessage::Close(Some(CloseFrame {
-                code: 4003,
-                reason: "room_unavailable".into(),
-            })))
-            .await;
+        close_socket(&mut socket, 4003, "room_unavailable").await;
         return;
     }
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
@@ -554,7 +632,8 @@ async fn connect(mut socket: WebSocket, room: Arc<Mutex<Room>>, _permit: OwnedSe
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { break };
                 let closing = matches!(outgoing.message, WsMessage::Close(_));
-                if !send_socket(&mut socket, outgoing.message).await || closing { break; }
+                if !send_socket(&mut socket, outgoing.message).await { break; }
+                if closing { finish_close(&mut socket).await; break; }
             }
             incoming = socket.recv() => {
                 match incoming {
@@ -562,7 +641,7 @@ async fn connect(mut socket: WebSocket, room: Arc<Mutex<Room>>, _permit: OwnedSe
                         last_seen = Instant::now();
                         let result = handle_message(&mut room.lock().unwrap(), id, &data);
                         if result.is_err() {
-                            send_socket(&mut socket, WsMessage::Close(Some(CloseFrame { code: 4002, reason: "input_limit".into() }))).await;
+                            close_socket(&mut socket, 4002, "input_limit").await;
                             break;
                         }
                     }
@@ -595,6 +674,34 @@ async fn send_socket(socket: &mut WebSocket, message: WsMessage) -> bool {
     )
 }
 
+async fn close_socket(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    if send_socket(
+        socket,
+        WsMessage::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })),
+    )
+    .await
+    {
+        finish_close(socket).await;
+    }
+}
+
+async fn finish_close(socket: &mut WebSocket) {
+    // Allow the close acknowledgement to arrive instead of resetting TCP with
+    // unread in-flight frames. Bound both the time and the work after rejection.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..8 {
+            match socket.recv().await {
+                Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+}
+
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -616,16 +723,39 @@ async fn security_headers(request: Request, next: Next) -> Response {
 }
 
 fn router(app: App) -> Router {
-    Router::new()
+    let prefix = app.base_path.clone();
+    let routes = Router::new()
+        .route_service("/", ServeFile::new("dist/index.html"))
+        .route_service("/r/{id}", ServeFile::new("dist/index.html"))
         .route("/api/rooms", post(create_room))
         .route("/api/rooms/{id}", get(room_metadata))
         .route("/api/rooms/{id}/close", post(close_room))
         .route("/api/rooms/{id}/ws", get(upgrade))
-        .fallback_service(
-            ServeDir::new("dist").not_found_service(ServeFile::new("dist/index.html")),
-        )
-        .layer(middleware::from_fn(security_headers))
-        .with_state(app)
+        .fallback_service(ServeDir::new("dist"))
+        .with_state(app);
+    let routes = if prefix.is_empty() {
+        routes
+    } else {
+        Router::new().nest(&format!("{prefix}/"), routes)
+    };
+    routes.layer(middleware::from_fn(security_headers))
+}
+
+fn base_path(value: &str) -> Result<String, &'static str> {
+    let prefix = value.trim_end_matches('/');
+    if !prefix.is_empty()
+        && (!prefix.starts_with('/')
+            || prefix.len() > 128
+            || prefix.split('/').skip(1).any(|part| {
+                part.is_empty()
+                    || !part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }))
+    {
+        return Err("MOCKPAD_BASE_PATH must be a path such as /mockpad");
+    }
+    Ok(prefix.to_owned())
 }
 
 #[tokio::main]
@@ -633,9 +763,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let origin = env::var("MOCKPAD_PUBLIC_ORIGIN")
         .ok()
         .map(|s| s.trim_end_matches('/').to_owned());
+    let trusted_proxy = env::var("MOCKPAD_TRUSTED_PROXY")
+        .ok()
+        .map(|value| value.parse::<IpAddr>().map(|ip| ip.to_canonical()))
+        .transpose()?;
+    if origin
+        .as_deref()
+        .is_some_and(|origin| origin.starts_with("https://"))
+        && trusted_proxy.is_none()
+    {
+        return Err(
+            "HTTPS公開時はMOCKPAD_TRUSTED_PROXYとプロキシによるX-Real-IPの上書きが必要です".into(),
+        );
+    }
     let app = App {
         rooms: Arc::default(),
         origin,
+        base_path: base_path(&env::var("MOCKPAD_BASE_PATH").unwrap_or_default())?,
+        trusted_proxy,
         admissions: Arc::default(),
         connections: Arc::new(Semaphore::new(MAX_ROOMS * MAX_PEERS)),
     };
@@ -668,9 +813,87 @@ mod tests {
         App {
             rooms: Arc::default(),
             origin: Some("http://localhost:3000".into()),
+            base_path: String::new(),
+            trusted_proxy: None,
             admissions: Arc::default(),
             connections: Arc::new(Semaphore::new(MAX_ROOMS * MAX_PEERS)),
         }
+    }
+
+    #[test]
+    fn base_path_accepts_only_unambiguous_path_segments() {
+        for (value, expected) in [
+            ("", ""),
+            ("/", ""),
+            ("/mockpad/", "/mockpad"),
+            ("/tools/mock-pad", "/tools/mock-pad"),
+        ] {
+            assert_eq!(base_path(value).unwrap(), expected);
+        }
+        for value in [
+            "mockpad",
+            "//mockpad",
+            "/a//b",
+            "/../mockpad",
+            "/a?b",
+            "/a%b",
+            "/a\r\n",
+        ] {
+            assert!(base_path(value).is_err());
+        }
+        assert!(base_path(&format!("/{}", "x".repeat(128))).is_err());
+    }
+
+    #[tokio::test]
+    async fn mounted_api_scopes_management_cookie_and_rejects_unmounted_routes() {
+        let mut app = app();
+        app.base_path = "/mockpad".into();
+        let response = router(app.clone())
+            .oneshot(
+                Request::post("/mockpad/api/rooms")
+                    .header("origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.contains("; Path=/mockpad/api/rooms/"));
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let path = format!("/mockpad/api/rooms/{}", metadata["id"].as_str().unwrap());
+        let response = router(app.clone())
+            .oneshot(
+                Request::get(path)
+                    .header("cookie", cookie.split(';').next().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["isHost"],
+            true
+        );
+        let response = router(app)
+            .oneshot(
+                Request::post("/api/rooms")
+                    .header("origin", "http://localhost:3000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -693,14 +916,215 @@ mod tests {
         assert!(app.admit(first, false).is_ok());
     }
 
+    #[test]
+    fn only_a_configured_proxy_can_supply_one_client_ip() {
+        let mut app = app();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.1"));
+        assert_eq!(
+            app.client_ip(None, &headers).unwrap(),
+            IpAddr::from([127, 0, 0, 1])
+        );
+        app.trusted_proxy = Some(IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(
+            app.client_ip(None, &headers).unwrap(),
+            IpAddr::from([192, 0, 2, 1])
+        );
+        let remote = Some(Extension(ConnectInfo(SocketAddr::from((
+            [192, 0, 2, 2],
+            1234,
+        )))));
+        assert_eq!(
+            app.client_ip(remote, &headers).unwrap(),
+            IpAddr::from([192, 0, 2, 2])
+        );
+        headers.append("x-real-ip", HeaderValue::from_static("192.0.2.3"));
+        assert_eq!(app.client_ip(None, &headers), Err(StatusCode::BAD_REQUEST));
+        for value in ["not-an-ip", "192.0.2.1, 192.0.2.2", ""] {
+            headers.insert("x-real-ip", HeaderValue::from_str(value).unwrap());
+            assert_eq!(app.client_ip(None, &headers), Err(StatusCode::BAD_REQUEST));
+        }
+        headers.clear();
+        assert_eq!(app.client_ip(None, &headers), Err(StatusCode::BAD_REQUEST));
+        headers.insert("x-real-ip", HeaderValue::from_static("::ffff:192.0.2.1"));
+        assert_eq!(
+            app.client_ip(None, &headers).unwrap(),
+            IpAddr::from([192, 0, 2, 1])
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_room_quota_is_per_source_and_recovers_after_expiry() {
+        async fn create(app: &App, ip: [u8; 4]) -> Response {
+            router(app.clone())
+                .oneshot(
+                    Request::post("/api/rooms")
+                        .extension(ConnectInfo(SocketAddr::from((ip, 1234))))
+                        .header("origin", "http://localhost:3000")
+                        .header("x-real-ip", "203.0.113.1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        let app = app();
+        for _ in 0..MAX_ROOMS_PER_SOURCE {
+            assert_eq!(
+                create(&app, [127, 0, 0, 1]).await.status(),
+                StatusCode::CREATED
+            );
+        }
+        assert_eq!(
+            create(&app, [127, 0, 0, 1]).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            create(&app, [127, 0, 0, 2]).await.status(),
+            StatusCode::CREATED
+        );
+        let now = Instant::now();
+        for room in app.rooms.lock().unwrap().values() {
+            let mut room = room.lock().unwrap();
+            if room.source == IpAddr::from([127, 0, 0, 1]) {
+                room.idle_since = Some(now - UNJOINED_ROOM_TTL);
+            }
+        }
+        app.clean(now);
+        assert_eq!(app.rooms.lock().unwrap().len(), 1);
+        assert_eq!(
+            create(&app, [127, 0, 0, 1]).await.status(),
+            StatusCode::CREATED
+        );
+    }
+
+    #[test]
+    fn never_joined_rooms_have_a_short_expiration_boundary() {
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
+        let start = room.idle_since.unwrap();
+        assert!(!room.expired(start + UNJOINED_ROOM_TTL - Duration::from_nanos(1)));
+        assert!(room.expired(start + UNJOINED_ROOM_TTL));
+        room.has_joined = true;
+        assert!(!room.expired(start + UNJOINED_ROOM_TTL));
+    }
+
+    #[tokio::test]
+    async fn ipv6_privacy_addresses_share_limits_without_expanding_proxy_trust() {
+        let mut app = app();
+        let network = u128::from("2001:db8:1:2::".parse::<Ipv6Addr>().unwrap());
+        for suffix in 1..=MAX_ROOMS_PER_SOURCE + 1 {
+            let ip = IpAddr::V6(Ipv6Addr::from(network + suffix as u128));
+            let response = router(app.clone())
+                .oneshot(
+                    Request::post("/api/rooms")
+                        .extension(ConnectInfo(SocketAddr::new(ip, 1234)))
+                        .header("origin", "http://localhost:3000")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if suffix <= MAX_ROOMS_PER_SOURCE {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
+        assert_eq!(app.admissions.lock().unwrap().len(), 1);
+        let another = IpAddr::V6(Ipv6Addr::from(network + 42));
+        assert!(app.admit(another, true).is_ok()); // tenth request in the shared window
+        assert_eq!(app.admit(another, true), Err(StatusCode::TOO_MANY_REQUESTS));
+        assert!(app.admit("2001:db8:1:3::1".parse().unwrap(), true).is_ok());
+        assert_eq!(
+            quota_key("::ffff:192.0.2.1".parse().unwrap()),
+            quota_key("192.0.2.1".parse().unwrap())
+        );
+
+        let proxy: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        app.trusted_proxy = Some(proxy);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("2001:db8:9:1::123"));
+        let peer = Some(Extension(ConnectInfo(SocketAddr::new(another, 1234))));
+        assert_eq!(app.client_ip(peer, &headers).unwrap(), another);
+        let peer = Some(Extension(ConnectInfo(SocketAddr::new(proxy, 1234))));
+        let effective = app.client_ip(peer, &headers).unwrap();
+        assert_eq!(effective, "2001:db8:9:1::123".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            quota_key(effective),
+            "2001:db8:9:1::".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_state_and_presence_queries_are_answered_only_once() {
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
+        let id = Uuid::new_v4();
+        let (peer, mut rx) = Peer::new();
+        room.peers.insert(id, peer);
+        let sync = Message::Sync(SyncMessage::SyncStep1(StateVector::default())).encode_v1();
+        assert!(handle_message(&mut room, id, &sync).is_ok());
+        drop(rx.recv().await.unwrap());
+        assert!(handle_message(&mut room, id, &sync).is_err());
+        assert!(rx.try_recv().is_err());
+        let query = Message::AwarenessQuery.encode_v1();
+        assert!(handle_message(&mut room, id, &query).is_ok());
+        drop(rx.recv().await.unwrap());
+        assert!(handle_message(&mut room, id, &query).is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn replayed_item_ids_do_not_rebroadcast_conflicting_bytes() {
+        use yrs::Text;
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
+        let sender = Uuid::new_v4();
+        let observer = Uuid::new_v4();
+        let (peer, _sender_rx) = Peer::new();
+        room.peers.insert(sender, peer);
+        let (peer, mut rx) = Peer::new();
+        room.peers.insert(observer, peer);
+        let client = (room.awareness.doc().client_id().get() as u32).wrapping_add(1);
+        for (index, content) in ["safe", "evil"].into_iter().enumerate() {
+            let doc = Doc::with_client_id(client as u64);
+            let text = doc.get_or_insert_text("code");
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, content);
+            let update = txn.encode_state_as_update_v1(&StateVector::default());
+            assert!(
+                handle_message(
+                    &mut room,
+                    sender,
+                    &Message::Sync(SyncMessage::Update(update)).encode_v1()
+                )
+                .is_ok()
+            );
+            if index == 0 {
+                assert!(rx.try_recv().is_ok());
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
+        }
+        use yrs::GetString;
+        assert_eq!(
+            room.awareness
+                .doc()
+                .get_or_insert_text("code")
+                .get_string(&room.awareness.doc().transact()),
+            "safe"
+        );
+    }
+
     #[tokio::test]
     async fn creation_cap_is_atomic_and_headers_cover_errors() {
         let app = app();
         for i in 0..MAX_ROOMS {
-            app.rooms
-                .lock()
-                .unwrap()
-                .insert(i.to_string(), Arc::new(Mutex::new(Room::new())));
+            app.rooms.lock().unwrap().insert(
+                i.to_string(),
+                Arc::new(Mutex::new(Room::new(IpAddr::from([192, 0, 2, i as u8])))),
+            );
         }
         let response = router(app.clone())
             .oneshot(
@@ -748,7 +1172,7 @@ mod tests {
         text.insert(&mut txn, 0, "must not be applied");
         let update = txn.encode_state_as_update_v1(&StateVector::default());
         let packet = Message::Sync(SyncMessage::Update(update)).encode_v1();
-        let mut room = Room::new();
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
         let id = Uuid::new_v4();
         let (peer, _rx) = Peer::new();
         room.peers.insert(id, peer);
@@ -770,7 +1194,8 @@ mod tests {
 
     #[test]
     fn expiration_boundary_and_connected_room() {
-        let mut room = Room::new();
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
+        room.has_joined = true;
         let start = room.idle_since.unwrap();
         assert!(!room.expired(start + ROOM_TTL - Duration::from_nanos(1)));
         assert!(room.expired(start + ROOM_TTL));
@@ -783,7 +1208,7 @@ mod tests {
     #[test]
     fn cleanup_closes_old_handles_and_does_not_restore_rooms() {
         let app = app();
-        let room = Arc::new(Mutex::new(Room::new()));
+        let room = Arc::new(Mutex::new(Room::new(IpAddr::from([127, 0, 0, 1]))));
         let start = room.lock().unwrap().idle_since.unwrap();
         app.rooms
             .lock()
@@ -799,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn admission_rejects_expiration_before_background_cleanup() {
         let app = app();
-        let mut room = Room::new();
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
         room.idle_since = Some(Instant::now() - ROOM_TTL);
         let room = Arc::new(Mutex::new(room));
         app.rooms
@@ -821,7 +1246,8 @@ mod tests {
 
     #[test]
     fn only_last_disconnect_starts_a_new_idle_period() {
-        let mut room = Room::new();
+        let mut room = Room::new(IpAddr::from([127, 0, 0, 1]));
+        room.has_joined = true;
         room.idle_since = None;
         let first = Uuid::new_v4();
         let last = Uuid::new_v4();
@@ -843,7 +1269,7 @@ mod tests {
     #[tokio::test]
     async fn only_host_can_close_and_origin_is_required() {
         let app = app();
-        let room = Room::new();
+        let room = Room::new(IpAddr::from([127, 0, 0, 1]));
         let secret = room.host_secret.clone();
         app.rooms
             .lock()

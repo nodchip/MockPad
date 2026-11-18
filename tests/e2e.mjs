@@ -5,7 +5,9 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
 
 const port = 3187;
-const base = `http://127.0.0.1:${port}`;
+const origin = `http://127.0.0.1:${port}`;
+const prefix = (process.env.MOCKPAD_BASE_PATH ?? '').replace(/\/+$/, '');
+const base = `${origin}${prefix}`;
 const executable = process.platform === 'win32' ? './target/debug/mockpad.exe' : './target/debug/mockpad';
 let server;
 let browser;
@@ -14,7 +16,7 @@ const errors = [];
 const check = name => { results.push(name); console.log(`PASS ${name}`); };
 async function startServer() {
   server = spawn(executable, [], {
-    env: { ...process.env, MOCKPAD_ADDR: `127.0.0.1:${port}`, MOCKPAD_PUBLIC_ORIGIN: base },
+    env: { ...process.env, MOCKPAD_ADDR: `127.0.0.1:${port}`, MOCKPAD_PUBLIC_ORIGIN: origin, MOCKPAD_BASE_PATH: prefix, MOCKPAD_TRUSTED_PROXY: undefined },
     stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true,
   });
   await new Promise((resolve, reject) => {
@@ -74,14 +76,14 @@ try {
     route = ws;
     upstream = ws.connectToServer();
   });
-  await a.goto(base);
+  assert.equal((await a.goto(`${base}/`)).status(), 200);
   await a.getByLabel('表示名').fill('面接官');
   await a.getByRole('button', { name: '部屋を作成する' }).click();
   await joined(a);
   const url = a.url();
   const roomId = url.split('/').at(-1);
   assert.match(roomId, /^[a-f0-9]{32}$/);
-  await b.goto(url);
+  assert.equal((await b.goto(url)).status(), 200);
   await b.getByLabel('表示名').fill('受験者');
   await b.getByRole('button', { name: '部屋に参加する' }).click();
   await joined(b);
@@ -94,7 +96,7 @@ try {
   await a.getByText('参加URLをコピーしました', { exact: true }).waitFor();
   check('Invite copies only the participant URL');
 
-  const forbidden = await guest.request.post(`${base}/api/rooms/${roomId}/close`, { headers: { Origin: base } });
+  const forbidden = await guest.request.post(`${base}/api/rooms/${roomId}/close`, { headers: { Origin: origin } });
   assert.equal(forbidden.status(), 403);
   const foreign = await host.request.post(`${base}/api/rooms/${roomId}/close`, { headers: { Origin: 'https://other.example' } });
   assert.equal(foreign.status(), 403);
@@ -147,6 +149,12 @@ try {
   await a.waitForFunction(() => document.querySelector('#tab-size').value === '4');
   check('Shared language and indentation settings in both directions');
 
+  await append(a, '\n// paste-' + 'batch'.repeat(400));
+  await expectCode(b, /paste-batchbatch/);
+  await joined(a);
+  await joined(b);
+  check('Bulk paste synchronizes within the message rate limit');
+
   for (const [language, prefix] of [['javascript', 'if (true) {'], ['python', 'if True:'], ['rust', 'fn main() {']]) {
     await a.getByLabel('言語', { exact: true }).selectOption(language);
     await editorEnd(a);
@@ -165,9 +173,8 @@ try {
   await a.keyboard.press('Home');
   await a.keyboard.press('Shift+ArrowRight');
   await a.keyboard.press('Shift+ArrowRight');
-  await b.locator('.yRemoteSelectionHead').first().waitFor();
-  const label = await b.locator('.yRemoteSelectionHead').first().evaluate(el => getComputedStyle(el, '::after').content);
-  assert.ok(label.includes('面接官'));
+  await b.waitForFunction(() => [...document.querySelectorAll('.yRemoteSelectionHead')]
+    .some(el => getComputedStyle(el, '::after').content.includes('面接官')));
   check('Remote cursor, selection and name label');
 
   blocked = true;
@@ -207,7 +214,7 @@ try {
   await b.getByRole('heading', { name: 'この部屋は利用できません' }).waitFor();
   check('Cancel then close removes code for both participants and rejects old URL');
 
-  await a.goto(base);
+  await a.goto(`${base}/`);
   await a.getByLabel('表示名').fill('面接官');
   await a.getByRole('button', { name: '部屋を作成する' }).click();
   await joined(a);

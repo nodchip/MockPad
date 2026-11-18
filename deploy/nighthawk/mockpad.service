@@ -1,0 +1,27 @@
+# Managed by MockPad deployment
+[Unit]
+Description=MockPad collaborative interview editor
+After=network.target
+
+[Service]
+Type=simple
+User=mockpad
+Group=mockpad
+WorkingDirectory=/opt/mockpad/current
+ExecStart=/opt/mockpad/current/mockpad
+Environment=MOCKPAD_ADDR=127.0.0.1:3001
+Environment=MOCKPAD_PUBLIC_ORIGIN=https://kishibe.dyndns.tv
+Environment=MOCKPAD_TRUSTED_PROXY=127.0.0.1
+Environment=MOCKPAD_BASE_PATH=/mockpad
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=1G
+CPUQuota=200%
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

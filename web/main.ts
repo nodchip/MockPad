@@ -13,23 +13,25 @@ import './style.css';
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const REMOTE = 'remote';
+const basePath = import.meta.env.BASE_URL;
+const appPath = (path = '') => `${basePath}${path.replace(/^\//, '')}`;
 const palette = ['#237b65', '#b15e25', '#6752b8', '#246da4', '#b1446b', '#7b741d'];
 const element = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 let active: RoomEditor | undefined;
 
 function shell(content: string) {
-  app.innerHTML = `<header class="site-header"><a class="brand" href="/"><span class="brand-mark">M</span>MockPad</a><span class="tagline">模擬面接のための共同エディター</span></header>${content}`;
+  app.innerHTML = `<header class="site-header"><a class="brand" href="${basePath}"><span class="brand-mark">M</span>MockPad</a><span class="tagline">模擬面接のための共同エディター</span></header>${content}`;
 }
 
 function unavailable(message = 'この部屋は終了したか、存在しません。') {
   active?.dispose();
   active = undefined;
-  shell('<main class="welcome"><div class="eyebrow">ROOM CLOSED</div><h1>この部屋は利用できません</h1><p id="reason"></p><a class="button primary" href="/">新しい部屋を作る</a></main>');
+  shell(`<main class="welcome"><div class="eyebrow">ROOM CLOSED</div><h1>この部屋は利用できません</h1><p id="reason"></p><a class="button primary" href="${basePath}">新しい部屋を作る</a></main>`);
   element('reason').textContent = message;
 }
 
 async function api(path: string, options: RequestInit = {}) {
-  return fetch(path, { ...options, cache: 'no-store', signal: AbortSignal.timeout(10000) });
+  return fetch(appPath(path), { ...options, cache: 'no-store', signal: AbortSignal.timeout(10000) });
 }
 
 async function landing(roomId?: string) {
@@ -69,7 +71,7 @@ async function landing(roomId?: string) {
         }
         if (!response.ok) throw new Error();
         roomId = (await response.json()).id as string;
-        history.pushState(null, '', `/r/${roomId}`);
+        history.pushState(null, '', appPath(`/r/${roomId}`));
       }
       active = new RoomEditor(roomId!, name);
     } catch {
@@ -94,6 +96,9 @@ class RoomEditor {
   private disposed = false;
   private ready = false;
   private styles: HTMLStyleElement;
+  private pendingUpdates: Uint8Array[] = [];
+  private pendingPresence = false;
+  private flushScheduled = false;
 
   constructor(private id: string, name: string) {
     shell(`<main class="workspace">
@@ -142,10 +147,8 @@ class RoomEditor {
     for (const event of ['stack-item-added', 'stack-item-popped', 'stack-cleared'] as const) this.undo.on(event, () => this.updateUndo());
     this.doc.on('update', (update: Uint8Array, origin: unknown) => {
       if (origin !== REMOTE) {
-        const encoder = encoding.createEncoder();
-        encoding.writeVarUint(encoder, 0);
-        syncProtocol.writeUpdate(encoder, update);
-        this.send(encoding.toUint8Array(encoder));
+        this.pendingUpdates.push(update);
+        this.scheduleSend();
       }
     });
     this.settings.observe(() => this.applySettings());
@@ -159,18 +162,16 @@ class RoomEditor {
       if (origin !== REMOTE) {
         const ids = [...added, ...updated, ...removed].filter(id => id === this.doc.clientID);
         if (ids.length) {
-          const encoder = encoding.createEncoder();
-          encoding.writeVarUint(encoder, 1);
-          encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, ids));
-          this.send(encoding.toUint8Array(encoder));
+          this.pendingPresence = true;
+          this.scheduleSend();
         }
       }
-      this.renderPresence();
+      if (origin === REMOTE) this.renderPresence();
     });
     this.awareness.setLocalStateField('user', { name, color: palette[this.doc.clientID % palette.length] });
     element('invite').onclick = async () => {
       try {
-        await navigator.clipboard.writeText(`${location.origin}/r/${this.id}`);
+        await navigator.clipboard.writeText(`${location.origin}${appPath(`/r/${this.id}`)}`);
         element('notice').textContent = '参加URLをコピーしました';
       } catch { element('notice').textContent = 'URLをコピーできませんでした。アドレスバーのURLを共有してください。'; }
     };
@@ -210,15 +211,44 @@ class RoomEditor {
     this.updateUndo();
   }
 
-  private send(data: Uint8Array) {
+  private scheduleSend() {
+    if (this.flushScheduled) return;
+    this.flushScheduled = true;
+    queueMicrotask(() => {
+      this.flushScheduled = false;
+      if (this.disposed) return;
+      this.renderPresence();
+      const updates = this.pendingUpdates;
+      this.pendingUpdates = [];
+      if (updates.length) {
+        // A single paste may emit one Yjs transaction per character.
+        const update = updates.length === 1 ? updates[0] : Y.mergeUpdates(updates);
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, 0);
+        syncProtocol.writeUpdate(encoder, update);
+        if (!this.send(encoding.toUint8Array(encoder))) { this.pendingPresence = false; return; }
+      }
+      if (this.pendingPresence) {
+        this.pendingPresence = false;
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, 1);
+        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID]));
+        this.send(encoding.toUint8Array(encoder));
+      }
+    });
+  }
+
+  private send(data: Uint8Array): boolean {
     if (data.byteLength > 256 * 1024) {
       // Finish the Yjs/Monaco transaction before disposing its model and observers.
       queueMicrotask(() => {
         if (!this.disposed) unavailable('一度に送れる編集量の上限を超えました。新しい部屋で、入力を分けてお試しください。');
       });
-      return;
+      return false;
     }
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(data);
+    if (this.socket?.readyState !== WebSocket.OPEN) return false;
+    this.socket.send(data);
+    return true;
   }
 
   private async connect() {
@@ -232,7 +262,7 @@ class RoomEditor {
       const metadata = await response.json();
       if (this.disposed) return;
       element('end-room').hidden = !metadata.isHost;
-      const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/api/rooms/${this.id}/ws`);
+      const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${appPath(`/api/rooms/${this.id}/ws`)}`);
       this.socket = socket;
       socket.binaryType = 'arraybuffer';
       socket.onopen = () => {
@@ -325,6 +355,8 @@ class RoomEditor {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.pendingUpdates = [];
+    this.pendingPresence = false;
     clearTimeout(this.retry);
     this.awareness.setLocalState(null);
     this.socket?.close();
@@ -340,7 +372,9 @@ class RoomEditor {
 
 window.addEventListener('pagehide', () => active?.dispose());
 window.addEventListener('popstate', () => location.reload());
-const match = /^\/r\/([a-f0-9]{32})\/?$/.exec(location.pathname);
-if (location.pathname === '/') void landing();
+const path = location.pathname === basePath.slice(0, -1) ? '/'
+  : location.pathname.startsWith(basePath) ? location.pathname.slice(basePath.length - 1) : '';
+const match = /^\/r\/([a-f0-9]{32})\/?$/.exec(path);
+if (path === '/') void landing();
 else if (match) void landing(match[1]);
 else unavailable();

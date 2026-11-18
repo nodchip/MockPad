@@ -6,10 +6,12 @@ import { chromium } from 'playwright-core';
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
 
-const base = 'http://127.0.0.1:3192';
+const origin = 'http://127.0.0.1:3192';
+const prefix = (process.env.MOCKPAD_BASE_PATH ?? '').replace(/\/+$/, '');
+const base = `${origin}${prefix}`;
 const results = [];
 const check = name => { results.push(name); console.log(`PASS ${name}`); };
-const executable = process.platform === 'win32' ? './target/debug/mockpad.exe' : './target/debug/mockpad';
+const executable = process.platform === 'win32' ? './target/release/mockpad.exe' : './target/release/mockpad';
 let server, browser;
 const errors = [];
 let stderr = '';
@@ -25,9 +27,9 @@ function presence(json) {
 }
 
 async function open(page, room) {
-  return page.evaluate(async room => {
+  return page.evaluate(async ({ room, prefix }) => {
     window.probes ??= [];
-    const socket = new WebSocket(`${location.origin.replace('http', 'ws')}/api/rooms/${room}/ws`);
+    const socket = new WebSocket(`${location.origin.replace('http', 'ws')}${prefix}/api/rooms/${room}/ws`);
     const state = { socket, close: null, received: 0 };
     socket.onclose = event => { state.close = event.code; };
     socket.onmessage = () => { state.received++; };
@@ -37,7 +39,7 @@ async function open(page, room) {
       socket.onerror = () => reject(new Error('WebSocket refused'));
     });
     return index;
-  }, room);
+  }, { room, prefix });
 }
 
 async function rejected(page, room, bytes) {
@@ -49,7 +51,7 @@ async function rejected(page, room, bytes) {
 
 try {
   server = spawn(executable, [], {
-    env: { ...process.env, MOCKPAD_ADDR: '127.0.0.1:3192', MOCKPAD_PUBLIC_ORIGIN: base },
+    env: { ...process.env, MOCKPAD_ADDR: '127.0.0.1:3192', MOCKPAD_PUBLIC_ORIGIN: origin, MOCKPAD_BASE_PATH: prefix, MOCKPAD_TRUSTED_PROXY: undefined },
     stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
   });
   server.stderr.on('data', chunk => { stderr += chunk.toString(); });
@@ -66,7 +68,7 @@ try {
   victim.on('console', message => {
     if (message.type() === 'error' && /content security policy|violates.*directive/i.test(message.text())) errors.push(message.text());
   });
-  const response = await victim.goto(base);
+  const response = await victim.goto(`${base}/`);
   const headers = response.headers();
   assert.equal(headers['x-frame-options'], 'DENY');
   assert.equal(headers['x-content-type-options'], 'nosniff');
@@ -82,12 +84,14 @@ try {
   const room = victim.url().split('/').at(-1);
   const attacker = await browser.newPage();
   attacker.setDefaultTimeout(10000);
-  await attacker.goto(base);
+  await attacker.goto(`${base}/`);
   let victimReconnects = 0;
   // The existing socket was opened before the listener; a reconnect would still be observable.
   victim.on('websocket', () => { victimReconnects++; });
   await rejected(attacker, room, presence('{"user":{"name":{"toString":null},"color":"#237b65"}}'));
   await rejected(attacker, room, presence('{"selection":{"anchor":{},"head":{"item":{"client":1,"clock":"bad"}}}}'));
+  await rejected(attacker, room, presence('{"selection":{"anchor":{},"head":{}}}'));
+  await rejected(attacker, room, presence('{"selection":{"anchor":{"tname":"code","assoc":0},"head":{"tname":"code","assoc":0}}}'));
   assert.equal(victimReconnects, 0);
   assert.equal(await victim.locator('#connection').textContent(), '接続済み');
   check('Malformed name and selection disconnect only the sender');
@@ -124,12 +128,12 @@ try {
   await attacker.evaluate(indices => { for (const i of indices) window.probes[i].socket.close(); }, peers);
   check('Ninth participant is refused');
 
-  // One room was created by the victim; nine more exhaust this IP's minute budget.
-  for (let i = 0; i < 9; i++) {
-    assert.equal((await fetch(`${base}/api/rooms`, { method: 'POST', headers: { Origin: base } })).status, 201);
+  // One room was created by the victim; seven more exhaust this IP's retained quota.
+  for (let i = 0; i < 7; i++) {
+    assert.equal((await fetch(`${base}/api/rooms`, { method: 'POST', headers: { Origin: origin } })).status, 201);
   }
   const limited = await fetch(`${base}/api/rooms`, {
-    method: 'POST', headers: { Origin: base, 'X-Forwarded-For': '192.0.2.123' },
+    method: 'POST', headers: { Origin: origin, 'X-Forwarded-For': '192.0.2.123', 'X-Real-IP': '192.0.2.124' },
   });
   assert.equal(limited.status, 429);
   assert.equal(limited.headers.get('x-frame-options'), 'DENY');
