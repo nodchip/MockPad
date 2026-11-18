@@ -124,6 +124,8 @@ class RoomEditor {
     }
     language.value = 'plaintext';
     this.model = monaco.editor.createModel('', 'plaintext');
+    // Monaco and Yjs must count the same characters at every line break.
+    this.model.setEOL(monaco.editor.EndOfLineSequence.LF);
     this.editor = monaco.editor.create(element('editor'), {
       model: this.model, automaticLayout: true, readOnly: true, fontSize: 15,
       fontFamily: "'Cascadia Code', 'Consolas', monospace", lineHeight: 25,

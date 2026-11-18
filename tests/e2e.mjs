@@ -61,8 +61,11 @@ try {
   browser = await chromium.launch(process.platform === 'win32'
     ? { channel: 'msedge', headless: true }
     : { headless: true, executablePath: process.env.CHROMIUM_PATH });
-  const host = await browser.newContext({ viewport: { width: 1360, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] });
-  const guest = await browser.newContext({ viewport: { width: 1360, height: 900 } });
+  const viewport = { width: 1360, height: 900 };
+  // Monaco derives its default line endings from the browser's operating system.
+  const userAgent = platform => `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`;
+  const host = await browser.newContext({ viewport, userAgent: userAgent('X11; Linux x86_64'), permissions: ['clipboard-read', 'clipboard-write'] });
+  const guest = await browser.newContext({ viewport, userAgent: userAgent('Windows NT 10.0; Win64; x64') });
   host.setDefaultTimeout(20000);
   guest.setDefaultTimeout(20000);
   const a = await host.newPage();
@@ -101,6 +104,22 @@ try {
   const foreign = await host.request.post(`${base}/api/rooms/${roomId}/close`, { headers: { Origin: 'https://other.example' } });
   assert.equal(foreign.status(), 403);
   check('Guest close and foreign-origin close are rejected');
+
+  await editorEnd(b);
+  await b.keyboard.press('Enter');
+  await expectCode(b, /^\n$/);
+  await expectCode(a, /^\n$/);
+  await b.keyboard.insertText('candidate');
+  await b.keyboard.press('Enter');
+  await expectCode(a, /^\ncandidate\n$/);
+  await editorEnd(a);
+  await a.keyboard.press('Backspace');
+  await a.keyboard.insertText('-edited');
+  await expectCode(a, /^\ncandidate-edited$/);
+  await expectCode(b, /^\ncandidate-edited$/);
+  await append(b, '\r\nsecond line\r\n');
+  await expectCode(a, /^\ncandidate-edited\nsecond line\n$/);
+  check('Candidate Enter and subsequent edits synchronize across operating systems');
 
   await append(a, '// 模擬面接 🦀\n');
   await expectCode(b, /模擬面接 🦀/);
@@ -160,12 +179,13 @@ try {
     await editorEnd(a);
     await a.keyboard.press('Control+a');
     await a.keyboard.insertText(prefix);
+    // Wait for the lazy-loaded language definition before testing auto-indent.
+    await a.waitForFunction(() => document.querySelectorAll('.view-line span[class*="mtk"]').length > 1);
     await a.keyboard.press('Enter');
     await a.keyboard.press('Tab');
     await a.keyboard.insertText('indented');
     await expectCode(a, /\n {8}indented/);
-    await expectCode(b, /indented/);
-    assert.ok(await a.locator('.view-line span[class*="mtk"]').count() > 1);
+    await expectCode(b, /\n {8}indented/);
   }
   check('JavaScript, Python and Rust highlighting and Enter/Tab spaces');
 
